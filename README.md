@@ -12,7 +12,7 @@ To use the library, **Python 3.8** or higher is required. An alternative method 
 ```bash
 sudo apt install python3-pip # If you don't have pip installed.
 pip3 install --upgrade pip   # If pip hasn't been updated yet.
-pip3 install --upgrade git+https://github.com/R0rt1z2/lkpatcher
+pip3 install --upgrade git+https://github.com/nisel11/lkpatcher
 ```
 > <small>[!NOTE]
 > _Windows users should omit the first two command(s) and install Python manually from [here](https://www.python.org/downloads/)._</small>
