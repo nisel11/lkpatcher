@@ -282,6 +282,75 @@ def add_certificate_to_partition(
     )
 
 
+def replace_partition_in_image(
+    patcher: LkPatcher,
+    partition_name: str,
+    data_file: Path,
+    memory_address: Optional[int] = None,
+) -> None:
+    """
+    Replace a partition's data in the LK image.
+
+    Args:
+        patcher: LkPatcher instance
+        partition_name: Name of the partition to replace
+        data_file: Path to the file containing new partition data
+        memory_address: Optional memory address to set
+    """
+    if not data_file.exists():
+        raise InvalidIOFile(f'Data file not found: {data_file}', data_file)
+
+    if partition_name not in patcher.image.partitions:
+        print(f'Error: Partition not found: {partition_name}')
+        list_partitions(patcher)
+        return
+
+    with open(data_file, 'rb') as f:
+        partition_data = f.read()
+
+    patcher.replace_partition(
+        partition_name,
+        partition_data,
+        memory_address,
+    )
+
+    print(
+        f'Replaced partition: {partition_name} ({len(partition_data)} bytes)'
+    )
+
+
+def apply_cert_bypass(
+    patcher: LkPatcher,
+    partition_name: Optional[str] = None,
+    legacy: bool = False,
+) -> None:
+    """
+    Apply cert exploit to partition(s).
+
+    Args:
+        patcher: LkPatcher instance
+        partition_name: Optional name of the partition to patch.
+                        If None, patches all partitions with mismatched hashes.
+        legacy: Use bypass_mode=1 (old V5/V6) with BIT_STRING wrapper
+    """
+    if partition_name:
+        if partition_name not in patcher.image.partitions:
+            print(f'Error: Partition not found: {partition_name}')
+            list_partitions(patcher)
+            return
+        patcher.cert_bypass(partition_name, legacy=legacy)
+        print(f'Applied cert-bypass to partition: {partition_name}')
+    else:
+        patched = patcher.cert_bypass_all(legacy=legacy)
+        if patched:
+            print(
+                f'Applied cert-bypass to {len(patched)} partition(s): '
+                f'{", ".join(patched)}'
+            )
+        else:
+            print('All cert2 hashes already match - nothing to patch')
+
+
 def main() -> int:
     """
     Main entry point for the LK patcher application.
@@ -302,7 +371,9 @@ def main() -> int:
         '  %(prog)s lk.img --analyze-policies    # Analyze security policies\n'
         '  %(prog)s --export-config config.json  # Export default config\n'
         '  %(prog)s lk.img --add-partition custom data.bin  # Add partition\n'
-        '  %(prog)s lk.img --remove-partition unwanted      # Remove partition',
+        '  %(prog)s lk.img --remove-partition unwanted      # Remove partition\n'
+        '  %(prog)s lk.img --replace-partition lk new_lk.bin --cert-bypass      # Replace lk image with new_lk.bin and apply cert exploit for old V5/V6 SoC (Most of the devices)\n'
+        '  %(prog)s lk.img --replace-partition lk new_lk.bin --cert-bypass-new  # Replace lk image with new_lk.bin and apply cert exploit for new V6 SoC',
     )
 
     parser.add_argument(
@@ -385,10 +456,26 @@ def main() -> int:
         help='Add certificate from CERT_FILE to PARTITION',
     )
     partition_group.add_argument(
+        '--replace-partition',
+        nargs=2,
+        metavar=('NAME', 'DATA_FILE'),
+        help='Replace partition NAME with DATA_FILE',
+    )
+    partition_group.add_argument(
+        '--cert-bypass',
+        action='store_true',
+        help='Bypass cert verification via ASN.1 exploit (old V5/V6)',
+    )
+    partition_group.add_argument(
+        '--cert-bypass-new',
+        action='store_true',
+        help='Bypass cert verification via ASN.1 exploit (new V6)',
+    )
+    partition_group.add_argument(
         '--partition-address',
         type=lambda x: int(x, 0),
-        default=0,
-        help='Memory address for new partition (hex or decimal)',
+        default=None,
+        help='Memory address for new or replaced partition (hex or decimal)',
     )
     partition_group.add_argument(
         '--partition-legacy',
@@ -474,6 +561,9 @@ def main() -> int:
                 args.add_partition,
                 args.remove_partition,
                 args.add_certificate,
+                args.replace_partition,
+                args.cert_bypass,
+                args.cert_bypass_new,
                 args.output,
             ]
         ):
@@ -544,7 +634,7 @@ def main() -> int:
                 patcher,
                 partition_name,
                 Path(data_file),
-                args.partition_address,
+                args.partition_address if args.partition_address is not None else 0,
                 not args.partition_legacy,
             )
             partition_modified = True
@@ -557,6 +647,28 @@ def main() -> int:
             partition_name, cert_file = args.add_certificate
             add_certificate_to_partition(
                 patcher, partition_name, Path(cert_file), args.cert_type
+            )
+            partition_modified = True
+
+        if args.replace_partition:
+            partition_name, data_file = args.replace_partition
+            replace_partition_in_image(
+                patcher,
+                partition_name,
+                Path(data_file),
+                args.partition_address,
+            )
+            partition_modified = True
+
+        if args.cert_bypass or args.cert_bypass_new:
+            cert_bypass_partition = None
+            if args.replace_partition:
+                cert_bypass_partition = args.replace_partition[0]
+
+            apply_cert_bypass(
+                patcher,
+                partition_name=cert_bypass_partition,
+                legacy=args.cert_bypass,
             )
             partition_modified = True
 

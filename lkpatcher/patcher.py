@@ -8,13 +8,15 @@ from __future__ import annotations
 import json
 import logging
 import re
+import struct
 from datetime import datetime
 from hashlib import sha256
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Union, cast
+from typing import Any, Dict, List, Optional, Tuple, Union, cast
 
 from liblk.exceptions import NeedleNotFoundException
 from liblk.image import LkImage
+from liblk.structures.partition import LkPartition
 
 from lkpatcher.config import PatcherConfig
 from lkpatcher.exceptions import (
@@ -599,3 +601,288 @@ class LkPatcher:
             'partition_count': len(self.image.partitions),
             'partitions': partition_info,
         }
+
+    def replace_partition(
+        self,
+        name: str,
+        data: bytes,
+        memory_address: Optional[int] = None,
+    ) -> None:
+        """
+        Replace a partition's data in the LK image.
+
+        Args:
+            name: Name of the partition to replace
+            data: New partition data bytes
+            memory_address: Optional memory address to set
+        """
+        if name not in self.image.partitions:
+            raise KeyError(f"Partition '{name}' not found in image")
+
+        partition = self.image.partitions[name]
+        partition.data = data
+
+        if memory_address is not None:
+            partition.header.memory_address = memory_address
+
+        self.image._rebuild_contents()
+        self.logger.info(
+            'Successfully replaced partition: %s (%d bytes)',
+            name,
+            len(data),
+        )
+
+    def cert_bypass(self, name: str, legacy: bool = False) -> None:
+        """
+        Apply cert bypass to partition NAME.
+
+        The MTK preloader ASN.1 parser has a logic flaw:
+          - bypass_mode=0 (new V6): only SEQUENCE (0x30) is parsed, other
+            TLVs are scanned for OID+BITSTRING patterns. Prepending a 0xA0
+            context-specific block with new hashes before the original DER
+            causes the parser to pick up the injected hashes.
+          - bypass_mode=1 (old V5/V6): any DER object is stepped
+            into. Wrapping the original cert2 in a BIT_STRING (0x03) causes
+            the parser to enter it, find the original SEQUENCE, and verify
+            the signature. The injected hashes in the 0xA0 block are used
+            for image verification.
+
+        Args:
+            name: Name of the partition to patch
+            legacy: Use bypass_mode=1 (old V5/V6) with BIT_STRING wrapper
+        """
+        if name not in self.image.partitions:
+            raise KeyError(f"Partition '{name}' not found in image")
+
+        partition = self.image.partitions[name]
+
+        cert2 = partition.cert2
+        if not cert2:
+            raise ValueError(
+                f"Partition '{name}' does not have a cert2 certificate"
+            )
+
+        orig_der = cert2.data
+        if not orig_der or orig_der[0] != 0x30:
+            raise ValueError(
+                f"cert2 for '{name}' does not start with SEQUENCE (0x30)"
+            )
+
+        image_hash, header_hash = self._compute_partition_hashes(partition)
+        self.logger.info('Computed hashes for cert-bypass on %s:', name)
+        self.logger.info('  Header hash: %s', header_hash.hex())
+        self.logger.info('  Image hash:  %s', image_hash.hex())
+
+        hash_block = self._build_hash_override_block(header_hash, image_hash)
+        self.logger.info('  Hash override block: %d bytes', len(hash_block))
+
+        if legacy:
+            bit_string = self._wrap_in_bit_string(orig_der)
+            self.logger.info(
+                '  Legacy BIT_STRING wrapper: %d bytes', len(bit_string)
+            )
+            new_blob = bit_string + hash_block + orig_der
+        else:
+            new_blob = hash_block + orig_der
+
+        cert2.data = new_blob
+        self.image._rebuild_contents()
+        self.logger.info(
+            'Successfully applied cert-bypass to partition %s '
+            '(mode=%s, new cert2 size: %d bytes)',
+            name,
+            'legacy' if legacy else 'v6',
+            len(new_blob),
+        )
+
+    def cert_bypass_all(self, legacy: bool = False) -> List[str]:
+        """
+        Apply cert bypass to all partitions where cert2 hashes don't match
+        the actual image data.
+
+        Scans all partitions with cert2, computes current hashes, and
+        compares them against the hashes stored in the cert2 DER.
+        Applies bypass only to partitions with mismatched hashes.
+
+        Args:
+            legacy: Use bypass_mode=1 (old V5/V6) with BIT_STRING wrapper
+
+        Returns:
+            List of partition names that were patched
+        """
+        patched = []
+        for name, partition in self.image.partitions.items():
+            cert2 = partition.cert2
+            if not cert2:
+                continue
+
+            orig_der = cert2.data
+            if not orig_der or orig_der[0] != 0x30:
+                self.logger.debug(
+                    'Skipping %s: cert2 does not start with SEQUENCE', name
+                )
+                continue
+
+            try:
+                stored_img_hash, stored_hdr_hash = self._extract_hashes_from_der(
+                    orig_der
+                )
+            except ValueError as e:
+                self.logger.debug(
+                    'Skipping %s: cannot extract hashes from cert2 (%s)',
+                    name,
+                    e,
+                )
+                continue
+
+            current_img_hash, current_hdr_hash = self._compute_partition_hashes(
+                partition
+            )
+
+            if (
+                stored_img_hash == current_img_hash
+                and stored_hdr_hash == current_hdr_hash
+            ):
+                self.logger.debug('Skipping %s: cert2 hashes match', name)
+                continue
+
+            self.logger.info(
+                'Hash mismatch detected for %s — applying cert-bypass', name
+            )
+            self.cert_bypass(name, legacy=legacy)
+            patched.append(name)
+
+        return patched
+
+    @staticmethod
+    def _extract_hashes_from_der(der: bytes) -> Tuple[bytes, bytes]:
+        """
+        Extract image hash and header hash from a CERT2 DER blob.
+
+        Searches for OID 2.16.886.2454.2.1 (image hash) and
+        OID 2.16.886.2454.2.4 (header hash), then reads the
+        following BIT STRING value.
+
+        Returns:
+            (image_hash, header_hash) tuple of 32-byte SHA-256 digests
+
+        Raises:
+            ValueError: If OIDs or BIT STRINGs are not found
+        """
+        oid_img_hash = '2.16.886.2454.2.1'
+        oid_hdr_hash = '2.16.886.2454.2.4'
+
+        def find_oid_hash(der_data: bytes, oid_str: str) -> bytes:
+            oid_encoded = LkPatcher._encode_oid(oid_str)
+            oid_tag = bytes([0x06, len(oid_encoded)]) + oid_encoded
+
+            idx = der_data.find(oid_tag)
+            if idx == -1:
+                raise ValueError(f'OID {oid_str} not found')
+
+            bs_off = idx + len(oid_tag)
+            if bs_off + 34 > len(der_data):
+                raise ValueError('Truncated BIT STRING after OID')
+            if der_data[bs_off] != 0x03:
+                raise ValueError(
+                    f'Expected BIT STRING (0x03), got 0x{der_data[bs_off]:02x}'
+                )
+            bs_len = der_data[bs_off + 1]
+            if bs_len != 0x21:
+                raise ValueError(
+                    f'Expected BIT STRING length 0x21, got 0x{bs_len:02x}'
+                )
+            if der_data[bs_off + 2] != 0x00:
+                raise ValueError('BIT STRING has non-zero unused bits')
+            return bytes(der_data[bs_off + 3 : bs_off + 35])
+
+        img_hash = find_oid_hash(der, oid_img_hash)
+        hdr_hash = find_oid_hash(der, oid_hdr_hash)
+        return img_hash, hdr_hash
+
+    @staticmethod
+    def _encode_der_length(n: int) -> bytes:
+        if n < 0x80:
+            return bytes([n])
+        s = n.to_bytes((n.bit_length() + 7) // 8, 'big')
+        return bytes([0x80 | len(s)]) + s
+
+    @staticmethod
+    def _encode_oid(oid: str) -> bytes:
+        parts = [int(x) for x in oid.split('.')]
+        first = 40 * parts[0] + parts[1]
+        out = bytearray([first])
+        for p in parts[2:]:
+            if p == 0:
+                out.append(0)
+                continue
+            parts_b = []
+            while p > 0:
+                parts_b.insert(0, p & 0x7F)
+                p >>= 7
+            for i, v in enumerate(parts_b):
+                if i != len(parts_b) - 1:
+                    out.append(0x80 | v)
+                else:
+                    out.append(v)
+        return bytes(out)
+
+    @staticmethod
+    def _build_oid_tlv(oid: str) -> bytes:
+        b = LkPatcher._encode_oid(oid)
+        return b'\x06' + LkPatcher._encode_der_length(len(b)) + b
+
+    @staticmethod
+    def _build_bitstring_tlv(payload: bytes) -> bytes:
+        val = b'\x00' + payload
+        return b'\x03' + LkPatcher._encode_der_length(len(val)) + val
+
+    @staticmethod
+    def _build_hash_override_block(header_hash: bytes, image_hash: bytes) -> bytes:
+        oid_img_hdr_hash = '2.16.886.2454.2.4'
+        oid_img_hash = '2.16.886.2454.2.1'
+
+        parts = []
+        parts.append(LkPatcher._build_oid_tlv(oid_img_hdr_hash))
+        parts.append(LkPatcher._build_bitstring_tlv(header_hash))
+        parts.append(LkPatcher._build_oid_tlv(oid_img_hash))
+        parts.append(LkPatcher._build_bitstring_tlv(image_hash))
+
+        content = b''.join(parts)
+        return b'\xa0' + LkPatcher._encode_der_length(len(content)) + content
+
+    @staticmethod
+    def _wrap_in_bit_string(asn1_data: bytes) -> bytes:
+        payload_len = len(asn1_data) + 1
+        if payload_len > 0xFFFF:
+            raise ValueError(
+                'ASN.1 payload too large for a two-byte-length BIT STRING'
+            )
+        return (
+            bytes([0x03, 0x82])
+            + struct.pack('>H', payload_len)
+            + b'\x00'
+            + asn1_data
+        )
+
+    def _compute_partition_hashes(self, partition: LkPartition) -> Tuple[bytes, bytes]:
+        """
+        Compute image hash and header hash for a partition.
+        """
+        header_bytes = bytes(partition.header)
+        data_bytes = bytes(partition.data)
+
+        alignment = (
+            partition.header.alignment if partition.header.is_extended else 8
+        )
+        if alignment and len(data_bytes) % alignment:
+            padding_size = alignment - (len(data_bytes) % alignment)
+        else:
+            padding_size = 0
+
+        full_part_bytes = header_bytes + data_bytes + b'\x00' * padding_size
+
+        header_hash = sha256(full_part_bytes[:512]).digest()
+        image_hash = sha256(full_part_bytes[512:]).digest()
+
+        return image_hash, header_hash
