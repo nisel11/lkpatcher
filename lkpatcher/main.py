@@ -21,6 +21,7 @@ from lkpatcher import (
     __description__,
     __version__,
 )
+from lkpatcher.cert_bypass import CertBypassMode
 from lkpatcher.config import LogLevel, PatcherConfig
 from lkpatcher.exceptions import (
     ConfigurationError,
@@ -361,6 +362,17 @@ def main() -> int:
         help='Analyze security policies in the LK partition',
     )
     group.add_argument(
+        '--cert-bypass',
+        nargs='?',
+        const='override',
+        choices=['wrap', 'override'],
+        default=None,
+        metavar='MODE',
+        help='Re-sign a patched image with the cert bypass and '
+        "exit, without applying any patches (MODE: 'override' (default) or "
+        "'wrap')",
+    )
+    group.add_argument(
         '--dry-run',
         action='store_true',
         help='Perform a dry run without writing changes',
@@ -538,6 +550,42 @@ def main() -> int:
             result = patcher.dump_partition(args.dump_partition)
             return 0 if result else 1
 
+        if args.cert_bypass is not None:
+            mode = CertBypassMode(args.cert_bypass)
+            output_path = args.output or args.bootloader_image.with_stem(
+                f'{args.bootloader_image.stem}-signed'
+            )
+
+            if config.dry_run:
+                logger.info(
+                    'Dry run: would re-sign (%s) and save to %s',
+                    mode.value,
+                    output_path,
+                )
+                return 0
+
+            if config.backup:
+                backup_path = create_backup(
+                    args.bootloader_image, config.backup_dir
+                )
+                logger.info('Created backup at %s', backup_path)
+
+            signed = patcher.apply_cert_bypass(mode)
+            if signed:
+                logger.info(
+                    'Applied cert bypass (%s) to: %s',
+                    mode.value,
+                    ', '.join(signed),
+                )
+            else:
+                logger.info(
+                    'Cert bypass requested, but nothing needed re-signing'
+                )
+
+            patcher.image.save(output_path)
+            logger.info('Re-signed image saved to %s', output_path)
+            return 0
+
         if args.add_partition:
             partition_name, data_file = args.add_partition
             add_partition_to_image(
@@ -584,7 +632,8 @@ def main() -> int:
                 )
         else:
             patched_path = patcher.patch(
-                output_path, patch_policies=args.patch_policies
+                output_path,
+                patch_policies=args.patch_policies,
             )
             logger.info('Patched image saved to %s', patched_path)
 

@@ -47,6 +47,8 @@ python3 -m lkpatcher [-h] [options] bootloader_image
 --category CATEGORY         Patch category to apply (can be used multiple times)
 --exclude CATEGORY          Patch category to exclude (can be used multiple times)
 --patch-policies            Patch security policies to disable verification
+--cert-bypass [MODE]        Re-sign a patched image with the cert bypass.
+                            MODE is 'override' (default) or 'wrap'
 ```
 
 #### Partition Management:
@@ -112,6 +114,12 @@ python3 -m lkpatcher lk.img --remove-partition unwanted
 
 # Add certificate to a partition
 python3 -m lkpatcher lk.img --add-certificate lk cert1.der --cert-type cert1
+
+# Re-sign an already-patched image
+python3 -m lkpatcher patched-lk.img --cert-bypass
+
+# Same, but using the wrap strategy
+python3 -m lkpatcher patched-lk.img --cert-bypass wrap
 ```
 
 ## Using as a Library

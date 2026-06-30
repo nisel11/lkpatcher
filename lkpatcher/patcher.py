@@ -11,7 +11,7 @@ import re
 from datetime import datetime
 from hashlib import sha256
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Union, cast
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union, cast
 
 from liblk.exceptions import NeedleNotFoundException
 from liblk.image import LkImage
@@ -24,6 +24,9 @@ from lkpatcher.exceptions import (
     PatchValidationError,
 )
 from lkpatcher.policy import patch_lk_security_policies
+
+if TYPE_CHECKING:
+    from lkpatcher.cert_bypass import CertBypassMode
 
 
 class PatchManager:
@@ -298,8 +301,47 @@ class LkPatcher:
 
         self.image.contents = new_contents
 
+    def apply_cert_bypass(
+        self, mode: Optional['CertBypassMode'] = None
+    ) -> List[str]:
+        """
+        Re-sign modified partitions using the cert bypass.
+
+        Args:
+            mode: Strategy to use (see
+                :class:`lkpatcher.cert_bypass.CertBypassMode`). Defaults to the
+                override strategy.
+
+        Returns:
+            Names of the partitions that were re-signed
+        """
+        from lkpatcher.cert_bypass import CertBypassMode, apply_cert_bypass
+
+        if mode is None:
+            mode = CertBypassMode.OVERRIDE
+
+        contents = bytes(self.image.contents)
+        signed_image = LkImage(contents)
+
+        region_end = 0
+        for partition in signed_image.partitions.values():
+            region_end = max(region_end, partition.end_offset)
+            for cert in partition.certs:
+                region_end = max(region_end, cert.end_offset)
+        trailing = contents[region_end:]
+
+        signed = apply_cert_bypass(signed_image, mode=mode)
+        if signed:
+            self.image.contents = bytearray(signed_image.contents) + bytearray(
+                trailing
+            )
+
+        return signed
+
     def patch(
-        self, output: Union[str, Path], patch_policies: bool = False
+        self,
+        output: Union[str, Path],
+        patch_policies: bool = False,
     ) -> Path:
         """
         Patch the bootloader image.
