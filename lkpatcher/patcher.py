@@ -301,6 +301,28 @@ class LkPatcher:
 
         self.image.contents = new_contents
 
+    def replace_partition(
+        self,
+        name: str,
+        data: bytes,
+        memory_address: Optional[int] = None,
+    ) -> None:
+        if name not in self.image.partitions:
+            raise KeyError(f"Partition '{name}' not found in image")
+
+        partition = self.image.partitions[name]
+        partition.data = data
+
+        if memory_address is not None:
+            partition.header.memory_address = memory_address
+
+        self._rebuild_image_contents()
+        self.logger.info(
+            'Successfully replaced partition: %s (%d bytes)',
+            name,
+            len(data),
+        )
+
     def apply_cert_bypass(
         self, mode: Optional['CertBypassMode'] = None
     ) -> List[str]:

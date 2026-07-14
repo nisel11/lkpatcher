@@ -283,6 +283,34 @@ def add_certificate_to_partition(
     )
 
 
+def replace_partition_in_image(
+    patcher: LkPatcher,
+    partition_name: str,
+    data_file: Path,
+    memory_address: Optional[int] = None,
+) -> None:
+    if not data_file.exists():
+        raise InvalidIOFile(f'Data file not found: {data_file}', data_file)
+
+    if partition_name not in patcher.image.partitions:
+        print(f'Error: Partition not found: {partition_name}')
+        list_partitions(patcher)
+        return
+
+    with open(data_file, 'rb') as f:
+        partition_data = f.read()
+
+    patcher.replace_partition(
+        partition_name,
+        partition_data,
+        memory_address,
+    )
+
+    print(
+        f'Replaced partition: {partition_name} ({len(partition_data)} bytes)'
+    )
+
+
 def main() -> int:
     """
     Main entry point for the LK patcher application.
@@ -303,7 +331,8 @@ def main() -> int:
         '  %(prog)s lk.img --analyze-policies    # Analyze security policies\n'
         '  %(prog)s --export-config config.json  # Export default config\n'
         '  %(prog)s lk.img --add-partition custom data.bin  # Add partition\n'
-        '  %(prog)s lk.img --remove-partition unwanted      # Remove partition',
+        '  %(prog)s lk.img --remove-partition unwanted      # Remove partition\n'
+        '  %(prog)s lk.img --replace-partition lk new_lk.bin  # Replace lk partition',
     )
 
     parser.add_argument(
@@ -397,10 +426,16 @@ def main() -> int:
         help='Add certificate from CERT_FILE to PARTITION',
     )
     partition_group.add_argument(
+        '--replace-partition',
+        nargs=2,
+        metavar=('NAME', 'DATA_FILE'),
+        help='Replace partition NAME with DATA_FILE',
+    )
+    partition_group.add_argument(
         '--partition-address',
         type=lambda x: int(x, 0),
-        default=0,
-        help='Memory address for new partition (hex or decimal)',
+        default=None,
+        help='Memory address for new or replaced partition (hex or decimal)',
     )
     partition_group.add_argument(
         '--partition-legacy',
@@ -486,6 +521,7 @@ def main() -> int:
                 args.add_partition,
                 args.remove_partition,
                 args.add_certificate,
+                args.replace_partition,
                 args.output,
             ]
         ):
@@ -550,6 +586,16 @@ def main() -> int:
             result = patcher.dump_partition(args.dump_partition)
             return 0 if result else 1
 
+        if args.replace_partition:
+            partition_name, data_file = args.replace_partition
+            replace_partition_in_image(
+                patcher,
+                partition_name,
+                Path(data_file),
+                args.partition_address,
+            )
+            partition_modified = True
+
         if args.cert_bypass is not None:
             mode = CertBypassMode(args.cert_bypass)
             output_path = args.output or args.bootloader_image.with_stem(
@@ -592,7 +638,7 @@ def main() -> int:
                 patcher,
                 partition_name,
                 Path(data_file),
-                args.partition_address,
+                args.partition_address if args.partition_address is not None else 0,
                 not args.partition_legacy,
             )
             partition_modified = True
