@@ -8,11 +8,12 @@ let
       owner = "R0rt1z2";
       repo = "liblk";
       rev = "master";
-      sha256 = "1nlp59iywbnr1s9qsvzp03qs1zlzr22lw34r9cr15v3wagwyclz5";
+      sha256 = "0ib1x4sqabvbhz78akwyrfcmw86yyqg7vlicdi4swvjgyqx1amkv";
     };
 
     pyproject = true;
     build-system = [ python3Packages.setuptools ];
+    propagatedBuildInputs = [ python3Packages.pyasn1 ];
   };
 
   lkpatcher = python3Packages.buildPythonPackage rec {
