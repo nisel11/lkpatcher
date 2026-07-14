@@ -324,7 +324,9 @@ class LkPatcher:
         )
 
     def apply_cert_bypass(
-        self, mode: Optional['CertBypassMode'] = None
+        self,
+        mode: Optional['CertBypassMode'] = None,
+        stock_image: Optional[LkImage] = None,
     ) -> List[str]:
         """
         Re-sign modified partitions using the cert bypass.
@@ -333,6 +335,8 @@ class LkPatcher:
             mode: Strategy to use (see
                 :class:`lkpatcher.cert_bypass.CertBypassMode`). Defaults to the
                 override strategy.
+            stock_image: Optional stock image to copy certificates from
+                for partitions that have no cert2.
 
         Returns:
             Names of the partitions that were re-signed
@@ -344,6 +348,22 @@ class LkPatcher:
 
         contents = bytes(self.image.contents)
         signed_image = LkImage(contents)
+
+        if stock_image is not None:
+            for name, partition in signed_image.partitions.items():
+                if partition.cert2 is not None:
+                    continue
+                stock_partition = stock_image.partitions.get(name)
+                if stock_partition is None or stock_partition.cert2 is None:
+                    continue
+                for cert in stock_partition.certs:
+                    partition.add_certificate(
+                        bytes(cert.data), cert.header.name
+                    )
+                self.logger.info(
+                    'Copied certificates from stock image to partition %s',
+                    name,
+                )
 
         region_end = 0
         for partition in signed_image.partitions.values():

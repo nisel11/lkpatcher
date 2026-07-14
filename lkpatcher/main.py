@@ -14,6 +14,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import List, Optional
 
+from liblk.image import LkImage
 from liblk.structures.partition import LkPartition
 
 from lkpatcher import (
@@ -311,6 +312,24 @@ def replace_partition_in_image(
     )
 
 
+def parse_cert_bypass_arg(value: str) -> tuple:
+    if ':' in value:
+        mode, stock_path = value.split(':', 1)
+        stock_path = Path(stock_path)
+        if not stock_path.exists():
+            raise InvalidIOFile(f'Stock image not found: {stock_path}', stock_path)
+    else:
+        mode = value
+        stock_path = None
+
+    if mode not in ('wrap', 'override'):
+        raise ValueError(
+            f"Invalid cert-bypass mode '{mode}'. Must be 'wrap' or 'override'"
+        )
+
+    return mode, stock_path
+
+
 def main() -> int:
     """
     Main entry point for the LK patcher application.
@@ -394,12 +413,12 @@ def main() -> int:
         '--cert-bypass',
         nargs='?',
         const='override',
-        choices=['wrap', 'override'],
         default=None,
-        metavar='MODE',
-        help='Re-sign a patched image with the cert bypass and '
-        "exit, without applying any patches (MODE: 'override' (default) or "
-        "'wrap')",
+        metavar='MODE[:STOCK_IMAGE]',
+        help='Re-sign a patched image with the cert bypass and exit. '
+        "MODE: 'override' (default) or 'wrap'. "
+        "Optionally append ':STOCK_IMAGE' to copy certificates from a "
+        'stock image before re-signing',
     )
     group.add_argument(
         '--dry-run',
@@ -597,7 +616,8 @@ def main() -> int:
             partition_modified = True
 
         if args.cert_bypass is not None:
-            mode = CertBypassMode(args.cert_bypass)
+            mode_str, stock_path = parse_cert_bypass_arg(args.cert_bypass)
+            mode = CertBypassMode(mode_str)
             output_path = args.output or args.bootloader_image.with_stem(
                 f'{args.bootloader_image.stem}-signed'
             )
@@ -616,7 +636,8 @@ def main() -> int:
                 )
                 logger.info('Created backup at %s', backup_path)
 
-            signed = patcher.apply_cert_bypass(mode)
+            stock_image = LkImage(stock_path) if stock_path else None
+            signed = patcher.apply_cert_bypass(mode, stock_image=stock_image)
             if signed:
                 logger.info(
                     'Applied cert bypass (%s) to: %s',
